@@ -5,7 +5,7 @@
 #   host projects, saved state and CI paths remain compatible.)
 # ==============================================================================
 cmake_minimum_required(VERSION 3.22)
-project(YDCore VERSION 1.2.0 LANGUAGES C CXX)
+project(YDCore VERSION 1.2.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

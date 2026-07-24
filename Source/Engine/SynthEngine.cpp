@@ -379,11 +379,20 @@ void SynthEngine::resolveMono (const ParamRefs& params, bool freshPress)
         return;
     }
 
-    if (v.getNote() == target)
-        return;
+    // A voice in its release tail is a finished phrase, not a sounding
+    // overlap: every key that started it has been released. Any fresh press
+    // must therefore re-gate the envelopes. Before 1.2.1 a same-pitch tap
+    // landing in the release tail was swallowed by the equal-note early
+    // return below, and a fresh Legato press onto a releasing voice changed
+    // pitch without re-gating — leaving the new note silent (rapid repeated
+    // notes lost, overlapping notes silent until re-pressed).
+    const bool releasing = v.isReleasing();
 
-    if (mode == PlayMode::Legato || ! freshPress)
-        v.changeNoteLegato (target, glideTime);        // no envelope retrigger
+    if (v.getNote() == target && ! releasing)
+        return;                                        // genuine sounding overlap: nothing to change
+
+    if (! releasing && (mode == PlayMode::Legato || ! freshPress))
+        v.changeNoteLegato (target, glideTime);        // intentional overlap: no envelope retrigger
     else
         v.startNote (params, target, vel, ++orderCounter, false, v.getCurrentNote(), glideTime, seedRng.next());
 }

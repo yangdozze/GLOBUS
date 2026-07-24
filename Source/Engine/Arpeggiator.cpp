@@ -173,6 +173,19 @@ void Arpeggiator::process (const juce::MidiBuffer& in, juce::MidiBuffer& out, in
             noteOff (m.getNoteNumber(), hold);
             buildSequence (mode, octaves);
         }
+        else if (m.isAllNotesOff() || m.isAllSoundOff()
+                 || (m.isController()
+                     && (m.getControllerNumber() == 120 || m.getControllerNumber() == 123)))
+        {
+            // All Notes Off / All Sound Off must clear the latched pattern and
+            // held-note bookkeeping too — before 1.2.1 the message passed
+            // through to the engine but the arp latch kept generating steps.
+            stopCurrent (out, pos);
+            heldCount = 0;
+            physicalCount = 0;
+            seqLen = 0;
+            out.addEvent (m, pos);
+        }
         else
         {
             out.addEvent (m, pos);

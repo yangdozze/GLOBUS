@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.2.1 — 2026-07-24 — MIDI note reliability hotfix
+
+Fixes two MIDI note reliability problems without changing the sound of any
+preset outside the previously broken sequences (the 1.1.0 render baseline
+remains bit-exact: 153/153 legacy renders, worst deviation 0).
+
+- **Fixed: rapid repeated notes were partially silent in Mono/Legato.** A voice
+  in its release tail still carried its note number, so a fresh press of the
+  same key was classified as a sounding overlap and never re-gated the
+  envelopes. Rapid same-key taps now retrigger on every press (20/20 and 50/50
+  in the regression suite; previously as few as half sounded on factory Mono
+  basses).
+- **Fixed: an overlapping note pressed while a Mono/Legato voice was releasing
+  could stay silent** (pitch changed via the legato path without re-gating the
+  envelope) and only start sounding after further key activity. Any fresh press
+  onto a releasing voice now re-gates. Intentional overlapping Legato (pressing
+  a second key while the first is held and sounding) keeps its no-retrigger
+  glide behaviour, and Mono High/Low note priority is unchanged.
+- **Fixed: the arpeggiator's latched (Hold) pattern survived All Notes Off /
+  All Sound Off** and kept generating steps. CC 120/123 and the channel-mode
+  All-Notes-Off message now clear the latch and held-note bookkeeping.
+- Added a focused MIDI note-reliability regression to the headless suite
+  (rapid same-note taps at multiple rates, same-block/same-offset event
+  ordering, velocity-0 Note On, overlapping Poly notes, Mono priorities,
+  portamento retrigger, sustain-pedal ownership, arp-latch clearing, and a
+  controller-state hygiene check). Suite grows from 1,038 to 1,265 checks.
+
+No parameter IDs, choice lists, state formats, preset contents or installer
+paths changed. Old projects and presets load unchanged.
+
+
 ## 1.2.0 — 2026-07-24 — wavetable engine & sound-quality upgrade
 
 Every change is **append-only**: all 1.1 parameter IDs, choice orders, preset

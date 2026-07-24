@@ -2200,6 +2200,419 @@ static juce::AudioBuffer<float> renderBaselineScenario (const juce::String& pres
     return all;
 }
 
+//==============================================================================
+// v1.2.1 MIDI note-reliability regression (rapid repeated notes / overlapping
+// notes). Duplicate same-pitch policy under test, as implemented by the engine:
+//   - a voice in its RELEASE tail is a finished phrase — any fresh press
+//     (same or different pitch, Mono or Legato) re-gates the envelopes;
+//   - a repeated Note On for a pitch that is STILL HELD and sounding does not
+//     retrigger in Mono/Legato (and never creates a stuck voice);
+//   - intentional overlapping Legato keeps its no-retrigger glide;
+//   - All Notes Off / All Sound Off clear voices, the mono stack AND the
+//     arpeggiator's latched pattern.
+// Attack counting uses rendered audio (envelope-rise events), never internal
+// counters: a voice can exist while producing silence.
+
+namespace notereliability
+{
+/** Timed MIDI event for reliability sequences. */
+struct REv { double t; int type; int a; int b; };   // 0 on, 1 off, 2 cc, 3 pressure, 4 pitchwheel
+
+juce::AudioBuffer<float> renderSeq (YDCoreAudioProcessor& proc, const std::vector<REv>& evts,
+                                    double lengthSec, double sr, int blockSize)
+{
+    const int total = (int) std::ceil (lengthSec * sr);
+    juce::AudioBuffer<float> out (2, total);
+    out.clear();
+    juce::AudioBuffer<float> block (2, blockSize);
+    int done = 0;
+    while (done < total)
+    {
+        const int n = std::min (blockSize, total - done);
+        block.setSize (2, n, false, false, true);
+        block.clear();
+        juce::MidiBuffer midi;
+        if (done == 0)
+        {
+            // controller state is persistent; independent renders initialise it
+            midi.addEvent (juce::MidiMessage::pitchWheel (1, 8192), 0);
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 1, 0), 0);
+            midi.addEvent (juce::MidiMessage::controllerEvent (1, 64, 0), 0);
+            midi.addEvent (juce::MidiMessage::channelPressureChange (1, 0), 0);
+        }
+        for (const auto& e : evts)
+        {
+            const int p = (int) std::llround (e.t * sr);
+            if (p >= done && p < done + n)
+            {
+                const int off = p - done;
+                switch (e.type)
+                {
+                    case 0: midi.addEvent (juce::MidiMessage::noteOn  (1, e.a, (juce::uint8) e.b), off); break;
+                    case 1: midi.addEvent (juce::MidiMessage::noteOff (1, e.a, (juce::uint8) 64), off); break;
+                    case 2: midi.addEvent (juce::MidiMessage::controllerEvent (1, e.a, e.b), off); break;
+                    case 3: midi.addEvent (juce::MidiMessage::channelPressureChange (1, e.a), off); break;
+                    case 4: midi.addEvent (juce::MidiMessage::pitchWheel (1, e.a), off); break;
+                    default: break;
+                }
+            }
+        }
+        proc.processBlock (block, midi);
+        for (int c = 0; c < 2; ++c)
+            out.copyFrom (c, done, block, c, 0, n);
+        done += n;
+    }
+    return out;
+}
+
+std::vector<float> rmsEnv (const juce::AudioBuffer<float>& buf, double sr)
+{
+    const int hop = std::max (1, (int) (0.001 * sr));
+    const int win = std::max (hop, (int) (0.010 * sr));
+    const float* L = buf.getReadPointer (0);
+    const float* R = buf.getNumChannels() > 1 ? buf.getReadPointer (1) : L;
+    std::vector<float> env;
+    for (int start = 0; start + win <= buf.getNumSamples(); start += hop)
+    {
+        double s = 0.0;
+        for (int i = start; i < start + win; ++i)
+        {
+            const double m = 0.5 * ((double) L[i] + (double) R[i]);
+            s += m * m;
+        }
+        env.push_back ((float) std::sqrt (s / win));
+    }
+    return env;
+}
+
+/** Audible attacks = envelope-rise events over the trailing 12 ms minimum,
+    thresholded at 35 % of the largest rise in the render, with hysteresis. */
+int countAttacks (const juce::AudioBuffer<float>& buf, double sr)
+{
+    auto env = rmsEnv (buf, sr);
+    const int look = 12;
+    std::vector<float> rise (env.size(), 0.0f);
+    float maxRise = 0.0f;
+    for (int i = 0; i < (int) env.size(); ++i)
+    {
+        float mn = env[(size_t) i];
+        for (int k = std::max (0, i - look); k < i; ++k)
+            mn = std::min (mn, env[(size_t) k]);
+        rise[(size_t) i] = env[(size_t) i] - mn;
+        maxRise = std::max (maxRise, rise[(size_t) i]);
+    }
+    const float thr = std::max (1.0e-4f, maxRise * 0.35f);
+    int n = 0, lastMs = -1000000;
+    bool armed = true;
+    for (int i = 0; i < (int) env.size(); ++i)
+    {
+        if (armed && rise[(size_t) i] > thr && i - lastMs >= 15) { ++n; lastMs = i; armed = false; }
+        else if (! armed && rise[(size_t) i] < thr * 0.4f)       { armed = true; }
+    }
+    return n;
+}
+
+double goertzel (const juce::AudioBuffer<float>& buf, double sr, double hz, double fromSec, double lenSec)
+{
+    const double w = 2.0 * juce::MathConstants<double>::pi * hz / sr;
+    const double k = 2.0 * std::cos (w);
+    double s1 = 0.0, s2 = 0.0;
+    const int start = juce::jlimit (0, buf.getNumSamples(), (int) (fromSec * sr));
+    const int len = std::min ((int) (lenSec * sr), buf.getNumSamples() - start);
+    const float* L = buf.getReadPointer (0);
+    const float* R = buf.getNumChannels() > 1 ? buf.getReadPointer (1) : L;
+    for (int i = start; i < start + len; ++i)
+    {
+        const double x = 0.5 * ((double) L[i] + (double) R[i]);
+        const double s0 = x + k * s1 - s2;
+        s2 = s1; s1 = s0;
+    }
+    return std::sqrt (std::max (0.0, s1 * s1 + s2 * s2 - k * s1 * s2)) / std::max (1, len);
+}
+
+void patch (YDCoreAudioProcessor& proc, int playMode, float releaseSec,
+            float glideSec = 0.0f, int priority = 0, float sustain = 0.15f)
+{
+    proc.getPresetManager().initPatch();
+    auto set = [&proc] (const juce::String& id, float v)
+    {
+        auto* p = proc.getApvts().getParameter (id);
+        p->setValueNotifyingHost (p->getNormalisableRange().convertTo0to1 (v));
+    };
+    set ("ampAttack", 0.001f);   set ("ampDecay", 0.04f);
+    set ("ampSustain", sustain); set ("ampRelease", releaseSec);
+    set ("filtAttack", 0.001f);  set ("filtDecay", 0.01f);
+    set ("filtSustain", 1.0f);   set ("filtRelease", releaseSec);
+    set ("cutoff", 18000.0f);
+    set ("playMode", (float) playMode);
+    set ("glideTime", glideSec);
+    set ("notePriority", (float) priority);
+    set ("osc1RandPhase", 0.0f); set ("subOn", 0.0f); set ("noiseLevel", 0.0f);
+    set ("arpOn", 0.0f);
+    set ("reverbMix", 0.0f); set ("delayMix", 0.0f); set ("chorusMix", 0.0f); set ("distMix", 0.0f);
+}
+
+std::vector<REv> taps (int n, int note, double len, double gap, double start = 0.05)
+{
+    std::vector<REv> e;
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = start + i * (len + gap);
+        e.push_back ({ t, 0, note, 100 });
+        e.push_back ({ t + len, 1, note, 0 });
+    }
+    return e;
+}
+} // namespace notereliability
+
+void testMidiNoteReliability()
+{
+    using namespace notereliability;
+    const double SR = 48000.0;
+    const int BS = 512;
+
+    // 1) Problem A regression: rapid same-note taps during a long release tail
+    //    must all retrigger — Mono and Legato (was: taps swallowed in 1.2.0).
+    for (const int mode : { 1, 2 })
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (SR, BS);
+        patch (proc, mode, 1.2f);
+        auto audio = renderSeq (proc, taps (20, 60, 0.060, 0.065), 20 * 0.125 + 1.6, SR, BS);
+        const int n = countAttacks (audio, SR);
+        expect (n == 20, "note-reliability: 20 rapid taps -> 20 attacks in "
+                + juce::String (mode == 1 ? "Mono" : "Legato") + " (got " + juce::String (n) + ")");
+    }
+    // ...and 50 taps at ~10/s
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (SR, BS);
+        patch (proc, 1, 1.2f);
+        auto audio = renderSeq (proc, taps (50, 60, 0.060, 0.040), 50 * 0.100 + 1.6, SR, BS);
+        const int n = countAttacks (audio, SR);
+        expect (n == 50, "note-reliability: 50 rapid Mono taps -> 50 attacks (got " + juce::String (n) + ")");
+    }
+    // ...and Poly articulated taps stay lossless
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (SR, BS);
+        patch (proc, 0, 0.12f);
+        auto audio = renderSeq (proc, taps (20, 60, 0.060, 0.065), 20 * 0.125 + 1.0, SR, BS);
+        const int n = countAttacks (audio, SR);
+        expect (n == 20, "note-reliability: 20 rapid Poly taps -> 20 attacks (got " + juce::String (n) + ")");
+    }
+
+    // 2) Problem B regression: press-and-hold during the release tail re-gates;
+    //    a following Legato overlap sounds while held and survives the first
+    //    note's release.
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (SR, BS);
+        patch (proc, 2, 1.2f);
+        std::vector<REv> seq = { {0.05,0,48,100}, {0.15,1,48,0},   // tap -> release tail
+                                 {0.30,0,48,100},                   // re-press during tail: must re-gate
+                                 {0.60,0,52,100},                   // legato overlap while holding
+                                 {1.60,1,48,0}, {2.40,1,52,0} };
+        auto audio = renderSeq (proc, seq, 3.2, SR, BS);
+        auto env = rmsEnv (audio, SR);
+        auto peakIn = [&env] (int a, int b)
+        {
+            float m = 0.0f;
+            for (int i = a; i < b && i < (int) env.size(); ++i) m = std::max (m, env[(size_t) i]);
+            return m;
+        };
+        const float heldC3 = peakIn (380, 580);
+        const float heldE3 = peakIn (700, 1550);
+        const float postC3 = peakIn (1700, 2300);
+        expect (heldC3 > 1.0e-3f, "note-reliability: re-press during tail re-gates (C3=" + juce::String (heldC3, 4) + ")");
+        expect (heldE3 > heldC3 * 0.5f, "note-reliability: legato overlap audible while held (E3=" + juce::String (heldE3, 4) + ")");
+        expect (postC3 > heldC3 * 0.4f, "note-reliability: overlap survives first release (post=" + juce::String (postC3, 4) + ")");
+        // intentional Legato overlap did NOT retrigger: exactly the two re-gates
+        const int n = countAttacks (audio, SR);
+        expect (n == 2, "note-reliability: legato overlap keeps no-retrigger (attacks=" + juce::String (n) + ")");
+    }
+
+    // 3) Same-block and same-offset Note Off/On never lose the new attack (Mono)
+    {
+        const double b = (double) BS / SR;
+        for (const auto& seqPair : { std::pair<double,double> { 0.2, 0.2 + 0.002 },   // same block
+                                     std::pair<double,double> { 0.2, 0.2 } })         // same offset
+        {
+            YDCoreAudioProcessor proc;
+            proc.prepareToPlay (SR, BS);
+            patch (proc, 1, 0.8f);
+            std::vector<REv> seq = { {0.05,0,60,100}, {seqPair.first,1,60,0},
+                                     {seqPair.second,0,60,100}, {0.6,1,60,0} };
+            auto audio = renderSeq (proc, seq, 1.6, SR, BS);
+            const int n = countAttacks (audio, SR);
+            expect (n == 2, "note-reliability: off/on at " + juce::String (seqPair.first == seqPair.second
+                    ? "same offset" : "same block") + " keeps both attacks (got " + juce::String (n) + ")");
+        }
+        juce::ignoreUnused (b);
+    }
+
+    // 4) NoteOn velocity 0 behaves as NoteOff (and the next tap attacks)
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (SR, BS);
+        patch (proc, 1, 0.8f);
+        std::vector<REv> seq = { {0.05,0,60,100}, {0.5,0,60,100}, {0.8,1,60,0} };
+        // convert the middle event to a raw NoteOn-velocity-0 (== NoteOff), then re-press
+        juce::AudioBuffer<float> out (2, (int) (2.0 * SR));
+        out.clear();
+        juce::AudioBuffer<float> block (2, BS);
+        int done = 0;
+        while (done < out.getNumSamples())
+        {
+            const int n = std::min (BS, out.getNumSamples() - done);
+            block.setSize (2, n, false, false, true);
+            block.clear();
+            juce::MidiBuffer midi;
+            auto at = [&] (double t) { const int p = (int) std::llround (t * SR); return p >= done && p < done + n ? p - done : -1; };
+            if (done == 0) midi.addEvent (juce::MidiMessage::pitchWheel (1, 8192), 0);
+            if (int o = at (0.05); o >= 0) midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), o);
+            if (int o = at (0.25); o >= 0) midi.addEvent (juce::MidiMessage (0x90, 60, 0), o);   // vel-0 NoteOn
+            if (int o = at (0.50); o >= 0) midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), o);
+            if (int o = at (0.80); o >= 0) midi.addEvent (juce::MidiMessage::noteOff (1, 60), o);
+            proc.processBlock (block, midi);
+            for (int c = 0; c < 2; ++c) out.copyFrom (c, done, block, c, 0, n);
+            done += n;
+        }
+        const int n = countAttacks (out, SR);
+        expect (n == 2, "note-reliability: NoteOn vel 0 == NoteOff (attacks=" + juce::String (n) + ")");
+    }
+
+    // 5) Mono priority semantics unchanged: High keeps the held note against a
+    //    lower press, then returns to it audibly on release without retrigger.
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (SR, BS);
+        patch (proc, 1, 0.4f, 0.0f, /*High*/1, 0.9f);
+        std::vector<REv> seq = { {0.05,0,60,100}, {0.4,0,57,100}, {0.9,1,60,0}, {1.5,1,57,0} };
+        auto audio = renderSeq (proc, seq, 2.4, SR, BS);
+        const int n = countAttacks (audio, SR);
+        expect (n == 1, "note-reliability: High priority ignores lower press (attacks=" + juce::String (n) + ")");
+        const double eA3 = goertzel (audio, SR, 440.0 * std::exp2 ((57 - 69) / 12.0), 1.0, 0.4);
+        expect (eA3 > 1.0e-4, "note-reliability: release returns to held note (A3 bin=" + juce::String (eA3, 6) + ")");
+    }
+
+    // 6) Poly overlap: both pitches sound simultaneously; releasing one keeps the other
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (SR, BS);
+        patch (proc, 0, 0.15f, 0.0f, 0, 0.9f);
+        std::vector<REv> seq = { {0.05,0,48,100}, {0.55,0,52,100}, {1.05,1,48,0}, {1.75,1,52,0} };
+        auto audio = renderSeq (proc, seq, 2.6, SR, BS);
+        auto hz = [] (int note) { return 440.0 * std::exp2 ((note - 69) / 12.0); };
+        expect (goertzel (audio, SR, hz (48), 0.65, 0.35) > 1.0e-4
+             && goertzel (audio, SR, hz (52), 0.65, 0.35) > 1.0e-4,
+                "note-reliability: overlapping Poly notes sound simultaneously");
+        expect (goertzel (audio, SR, hz (52), 1.30, 0.40) > 1.0e-4,
+                "note-reliability: releasing C3 keeps E3");
+    }
+
+    // 7) Portamento Mono taps always retrigger (glide cannot gate the voice off)
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (SR, BS);
+        patch (proc, 1, 0.8f, 0.12f);
+        auto seq = taps (10, 50, 0.060, 0.065);
+        for (int i = 0; i < 10; ++i) { seq[(size_t) (2 * i)].a = 50 + (i % 3) * 5; seq[(size_t) (2 * i + 1)].a = 50 + (i % 3) * 5; }
+        auto audio = renderSeq (proc, seq, 10 * 0.125 + 1.2, SR, BS);
+        const int n = countAttacks (audio, SR);
+        expect (n == 10, "note-reliability: portamento taps retrigger 10/10 (got " + juce::String (n) + ")");
+    }
+
+    // 8) All Notes Off clears the arpeggiator's latched pattern too
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (SR, BS);
+        patch (proc, 0, 0.05f);
+        auto set = [&proc] (const juce::String& id, float v)
+        {
+            auto* p = proc.getApvts().getParameter (id);
+            p->setValueNotifyingHost (p->getNormalisableRange().convertTo0to1 (v));
+        };
+        set ("arpOn", 1.0f);
+        set ("arpHold", 1.0f);
+        std::vector<REv> seq = { {0.05,0,48,100}, {0.1,1,48,0}, {2.0,2,123,0} };
+        auto audio = renderSeq (proc, seq, 3.2, SR, BS);
+        auto env = rmsEnv (audio, SR);
+        float latched = 0.0f, cleared = 0.0f;
+        for (int i = 500; i < 1900 && i < (int) env.size(); ++i) latched = std::max (latched, env[(size_t) i]);
+        for (int i = 2400; i < (int) env.size(); ++i) cleared = std::max (cleared, env[(size_t) i]);
+        expect (latched > 1.0e-3f, "note-reliability: arp hold latches (peak=" + juce::String (latched, 4) + ")");
+        expect (cleared < 2.0e-3f, "note-reliability: All Notes Off clears the arp latch (peak=" + juce::String (cleared, 5) + ")");
+    }
+
+    // 9) Controller hygiene: a bent/wheeled/pressed render must not colour a
+    //    following neutral render (same attacks, same pitch energy, no bend).
+    {
+        YDCoreAudioProcessor procA;
+        procA.prepareToPlay (SR, BS);
+        patch (procA, 0, 0.2f);
+        std::vector<REv> chaos = { {0.02,4,16000,0}, {0.05,0,60,100}, {0.2,2,1,127}, {0.3,3,110,0},
+                                   {0.5,4,2000,0}, {0.7,1,60,0} };
+        renderSeq (procA, chaos, 1.4, SR, BS);
+        auto after = renderSeq (procA, taps (3, 60, 0.2, 0.2), 1.8, SR, BS);
+
+        YDCoreAudioProcessor procB;
+        procB.prepareToPlay (SR, BS);
+        patch (procB, 0, 0.2f);
+        auto fresh = renderSeq (procB, taps (3, 60, 0.2, 0.2), 1.8, SR, BS);
+
+        expect (countAttacks (after, SR) == countAttacks (fresh, SR),
+                "note-reliability: controller state does not change the attack pattern");
+        const double f0 = 440.0 * std::exp2 ((60 - 69) / 12.0);
+        bool binsOk = true;
+        for (int k = 0; k < 3; ++k)
+        {
+            const double t = 0.05 + k * 0.4 + 0.05;
+            const double eA = goertzel (after, SR, f0, t, 0.10);
+            const double eF = goertzel (fresh, SR, f0, t, 0.10);
+            if (std::abs (eA / std::max (1.0e-12, eF) - 1.0) > 0.02) binsOk = false;
+        }
+        expect (binsOk, "note-reliability: neutral render after chaos matches a fresh instance");
+    }
+
+    // 10) Representative factory Mono/Legato Lead & Bass presets: every tap sounds
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (SR, BS);
+        auto& pm = proc.getPresetManager();
+        int tested = 0;
+        for (int i = 0; i < pm.getNumPresets() && tested < 6; ++i)
+        {
+            const auto cat = pm.getPresets()[(size_t) i].category;
+            if (! (cat.containsIgnoreCase ("Bass") || cat.containsIgnoreCase ("Lead")))
+                continue;
+            pm.loadPresetAt (i);
+            if ((int) proc.getApvts().getRawParameterValue ("playMode")->load() == 0)
+                continue;
+            if (proc.getApvts().getRawParameterValue ("arpOn")->load() > 0.5f)
+                continue;
+            ++tested;
+            const int note = cat.containsIgnoreCase ("Lead") ? 57 : 45;
+            auto audio = renderSeq (proc, taps (10, note, 0.120, 0.130), 10 * 0.25 + 1.5, SR, BS);
+            // per-tap audibility: each tap window rises above the level just before it
+            auto env = rmsEnv (audio, SR);
+            int ok = 0;
+            for (int k = 0; k < 10; ++k)
+            {
+                const int t0 = (int) ((0.05 + k * 0.25) * 1000.0);
+                float before = env[(size_t) std::max (0, t0 - 3)];
+                float peak = 0.0f;
+                for (int j = t0; j < t0 + 200 && j < (int) env.size(); ++j)
+                    peak = std::max (peak, env[(size_t) j]);
+                if (peak > 1.0e-4f && peak > before * 1.15f) ++ok;
+            }
+            expect (ok == 10, "note-reliability: factory '" + pm.getPresets()[(size_t) i].name
+                    + "' 10 rapid taps all sound (got " + juce::String (ok) + ")");
+        }
+        expect (tested > 0, "note-reliability: found factory Mono/Legato Lead/Bass presets to test");
+    }
+}
+
 /** Spectral stats over the sustain window (0.5..1.4 s): centroid + band energy. */
 static void baselineSpectralStats (const juce::AudioBuffer<float>& buf, double sr,
                                    double& centroidHz, double& lowE, double& midE, double& highE)
@@ -2456,6 +2869,7 @@ int main (int argc, char* argv[])
     testV12QualitySwitchingAndNewMods();
     testV12FxQualityAndGainStaging();
     testV12FactoryPresets();
+    testMidiNoteReliability();
 
     std::cout << "----------------------------------------" << std::endl;
     std::cout << checks << " checks, " << failures << " failures" << std::endl;
