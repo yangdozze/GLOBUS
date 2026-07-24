@@ -65,7 +65,7 @@ jobs:
 
       - name: Sign plugin binaries (Azure Trusted Signing)
         if: steps.signcheck.outputs.available == 'true'
-        uses: azure/trusted-signing-action@v0.5.1
+        uses: azure/[email protected]
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -120,7 +120,7 @@ jobs:
 
       - name: Sign installer (Azure Trusted Signing)
         if: steps.signcheck.outputs.available == 'true'
-        uses: azure/trusted-signing-action@v0.5.1
+        uses: azure/[email protected]
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -142,6 +142,64 @@ jobs:
                       Sort-Object FullName -Descending | Select-Object -First 1
           & $signtool.FullName verify /pa /all /v "installer/Output/GLOBUS-Installer-Windows-x64.exe" 2>&1 | Tee-Object -Append -FilePath signing.log
           exit $LASTEXITCODE
+
+      - name: Verify upgrade from GLOBUS 1.2.0
+        shell: pwsh
+        run: |
+          $log = "upgrade-test.log"
+          $script:fails = 0
+          function Check($name, $cond) {
+            $status = if ($cond) { "[OK]" } else { "[FAIL]" }
+            "$status $name" | Tee-Object -FilePath $log -Append
+            if (-not $cond) { $script:fails++ }
+          }
+
+          # fetch the archived 1.2.0 installer (hash-pinned; either source is fine)
+          $urls = @(
+            "https://github.com/yangdozze/GLOBUS/releases/download/v1.2.0/GLOBUS-Installer-Windows-x64.exe",
+            "https://pub.hyperagent.com/api/published/pbf01KYAGW4N4_VDZ9FB50P5KXYC8Y/GLOBUS-Installer-Windows-x64.exe"
+          )
+          $got = $false
+          foreach ($u in $urls) {
+            try {
+              Invoke-WebRequest -Uri $u -OutFile old-installer.exe -UseBasicParsing -ErrorAction Stop
+              $h = (Get-FileHash old-installer.exe -Algorithm SHA256).Hash
+              if ($h -eq "807A121F58D76D8B288062BCD93A60B1C5998CF6127C6E17042394699C58351C") { $got = $true; break }
+            } catch { }
+          }
+          Check "archived 1.2.0 installer fetched and hash-verified" $got
+          if (-not $got) { Get-Content $log; exit 1 }
+
+          # install 1.2.0, plant a user preset, then upgrade in place with the new build
+          $p = Start-Process -FilePath "old-installer.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          Check "GLOBUS 1.2.0 silent install" ($p.ExitCode -eq 0)
+          $presetDir = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "GLOBUS\Presets"
+          New-Item -ItemType Directory -Force -Path $presetDir | Out-Null
+          '{"name":"Upgrade Survival","category":"User","params":{}}' | Out-File "$presetDir\Upgrade_Survival.json" -Encoding utf8
+
+          $p2 = Start-Process -FilePath "installer\Output\GLOBUS-Installer-Windows-x64.exe" `
+                -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          Check "GLOBUS 1.2.1 upgrade install over 1.2.0" ($p2.ExitCode -eq 0)
+
+          $vst3 = "C:\Program Files\Common Files\VST3\GLOBUS.vst3\Contents\x86_64-win\GLOBUS.vst3"
+          $h1 = (Get-FileHash "build/YDCore_artefacts/Release/VST3/GLOBUS.vst3/Contents/x86_64-win/GLOBUS.vst3").Hash
+          Check "upgraded VST3 is the 1.2.1 build" ((Get-FileHash $vst3).Hash -eq $h1)
+          $exe = "C:\Program Files\Ninth Parallel Audio\GLOBUS\GLOBUS.exe"
+          $ver = (Get-Item $exe).VersionInfo.ProductVersion
+          Check "upgraded standalone reports 1.2.1" ($ver -like "1.2.1*")
+          Check "user preset survives the upgrade" (Test-Path "$presetDir\Upgrade_Survival.json")
+          $unins = @(Get-ChildItem "C:\Program Files\Ninth Parallel Audio\GLOBUS" -Filter "unins*.exe")
+          Check "upgrade replaced (single uninstaller)" ($unins.Count -eq 1)
+
+          # uninstall so the fresh-install test below starts from a clean machine
+          $p3 = Start-Process -FilePath $unins[0].FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          Check "uninstall after upgrade" ($p3.ExitCode -eq 0)
+          Start-Sleep -Seconds 3
+          Check "user preset survives uninstall" (Test-Path "$presetDir\Upgrade_Survival.json")
+          Remove-Item "$presetDir\Upgrade_Survival.json" -Force -ErrorAction SilentlyContinue
+
+          Get-Content $log
+          if ($script:fails -gt 0) { exit 1 }
 
       - name: Test installer (silent install, verify, uninstall)
         shell: pwsh
@@ -253,14 +311,24 @@ jobs:
           }
           gh release delete ci-latest --yes --cleanup-tag 2>$null
           if ($LASTEXITCODE -ne 0) { Write-Host "no previous ci-latest release" }
-          gh release create ci-latest `
-            "dist/GLOBUS-Installer-Windows-x64.exe" `
-            "dist/GLOBUS-VST3-Windows-x64.zip" `
-            "dist/GLOBUS-Standalone-Windows-x64.zip" `
-            "dist/SHA256SUMS.txt" `
-            --title "GLOBUS 1.2.0 - Windows x64 (CI build)" `
-            --notes "Automated Windows x64 Release build by Ninth Parallel Audio. Easiest install: run GLOBUS-Installer-Windows-x64.exe (VST3 to Common Files\VST3, Standalone app, Start Menu shortcut, uninstaller; user presets are never touched). Manual install: unzip GLOBUS-VST3-Windows-x64.zip and copy 'GLOBUS.vst3' to C:\Program Files\Common Files\VST3, then rescan plugins in FL Studio. Verify downloads against SHA256SUMS.txt. $signNote Commit ${{ github.sha }}."
-          exit 0
+          # deleting the tag is asynchronous on the server; retry the create so
+          # a race cannot silently leave the repository without a release
+          $created = $false
+          for ($try = 1; $try -le 5; $try++) {
+            gh release create ci-latest `
+              "dist/GLOBUS-Installer-Windows-x64.exe" `
+              "dist/GLOBUS-VST3-Windows-x64.zip" `
+              "dist/GLOBUS-Standalone-Windows-x64.zip" `
+              "dist/SHA256SUMS.txt" `
+              --title "GLOBUS 1.2.1 - Windows x64 (CI build)" `
+              --notes "Automated Windows x64 Release build by Ninth Parallel Audio. Easiest install: run GLOBUS-Installer-Windows-x64.exe (VST3 to Common Files\VST3, Standalone app, Start Menu shortcut, uninstaller; user presets are never touched). Manual install: unzip GLOBUS-VST3-Windows-x64.zip and copy 'GLOBUS.vst3' to C:\Program Files\Common Files\VST3, then rescan plugins in FL Studio. Verify downloads against SHA256SUMS.txt. $signNote Commit ${{ github.sha }}."
+            if ($LASTEXITCODE -eq 0) { $created = $true; break }
+            Write-Host "release create failed (attempt $try), retrying in 15 s"
+            Start-Sleep -Seconds 15
+          }
+          if (-not $created) { Write-Error "gh release create failed after 5 attempts"; exit 1 }
+          gh release view ci-latest --json assets --jq ".assets | length"
+          if ($LASTEXITCODE -ne 0) { Write-Error "release verification failed"; exit 1 }
 
       - name: Publish debug logs on failure
         if: failure()
