@@ -65,7 +65,7 @@ jobs:
 
       - name: Sign plugin binaries (Azure Trusted Signing)
         if: steps.signcheck.outputs.available == 'true'
-        uses: azure/[email protected]
+        uses: azure/trusted-signing-action@v0.5.1
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -120,7 +120,7 @@ jobs:
 
       - name: Sign installer (Azure Trusted Signing)
         if: steps.signcheck.outputs.available == 'true'
-        uses: azure/[email protected]
+        uses: azure/trusted-signing-action@v0.5.1
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
