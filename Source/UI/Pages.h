@@ -500,7 +500,7 @@ public:
 
         g.setColour (theme::textDim);
         g.setFont (LookAndFeelYD::uiFont (10.5f));
-        g.drawText ("GLOBUS 1.2.1  |  Ninth Parallel Audio  |  VST3 + Standalone",
+        g.drawText ("GLOBUS 1.2.2  |  Ninth Parallel Audio  |  VST3 + Standalone",
                     c.removeFromTop (rowH), juce::Justification::centredLeft);
     }
 

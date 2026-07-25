@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.2.2 — 2026-07-25 — play-mode selector
+
+Turns the top bar's passive play-mode label into a functional selector and
+closes the "Lead presets appear as Poly" report. **No sound changes**: no DSP
+was touched, and the 1.1.0 render baseline remains bit-exact.
+
+- **New: play-mode selector in the top bar.** The always-blue passive label is
+  now a real control bound to the existing `playMode` parameter (a complete
+  host-automation gesture per change). Left-click, Space or Return cycles
+  POLY → MONO → LEGATO; right-click opens a direct-selection menu; Up/Right
+  and Down/Left arrow keys step forward/back; the mouse wheel steps with a
+  250 ms cooldown against accidental rapid switching. Each mode has its own
+  colour (POLY blue, MONO amber, LEGATO violet) plus hover, pressed, focused
+  and disabled states and a tooltip.
+- **Investigated: "Lead presets appear as Poly".** An empirical scan of all
+  171 presets (71 factory + 100 NIGHT ORBIT Vol. 1) with the real processor
+  and a live editor found saved mode == parameter == engine == top-bar text in
+  171/171 cases — there was never a loading or sync bug. Lead presets such as
+  Chrome Cutter, Digital Cry and Neon Bite store Poly by design; the confusion
+  came from the old passive indicator. **No preset contents were changed.**
+- **Documented: the deterministic mode-change-while-held policy** at
+  `SynthEngine::modeChangeFlush()` (gentle release of all voices, cleared
+  mono/legato stacks, no stuck state; held keys re-press in the new mode).
+  Comment only — the engine behaviour is unchanged.
+- Added a play-mode selector & sync regression to the headless suite:
+  preset → parameter → engine → UI sync for Poly/Mono/Legato presets, click
+  cycling, direct selection, keyboard activation, host automation, state
+  save/restore, preset-load-after-manual-change, Init/Randomize policy, rapid
+  preset switching, and mode changes while notes are held or sustained
+  (44.1/48/96 kHz × 32/512/4096-sample blocks, arp-latch + CC 123 clear).
+  Suite grows from 1,265 to 1,321 checks.
+- CI: the Windows release workflow is now self-maintaining — the version and
+  release title derive from CMake, the upgrade test discovers the previous
+  release dynamically (with a hash-pinned fallback), assets publish to both
+  the rolling `ci-latest` release and a permanent `v<version>` release.
+
+No parameter IDs, choice lists, state formats, preset contents or installer
+paths changed. NIGHT ORBIT Vol. 1 is byte-identical. Old projects and presets
+load unchanged.
+
+
 ## 1.2.1 — 2026-07-24 — MIDI note reliability hotfix
 
 Fixes two MIDI note reliability problems without changing the sound of any
