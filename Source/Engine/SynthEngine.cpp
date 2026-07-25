@@ -438,6 +438,15 @@ void SynthEngine::allNotesOff (bool hard)
     std::fill (std::begin (physicallyHeld), std::end (physicallyHeld), false);
 }
 
+// Deterministic play-mode-change policy (documented for 1.2.2): switching
+// POLY / MONO / LEGATO while notes are active gently releases every sounding
+// voice through its natural amp release (click-free, no fastSteal), clears the
+// mono/legato stack, pending steals and held-note bookkeeping, and starts the
+// new mode from silence. Keys still physically held after the switch simply
+// release without further effect; re-pressing them plays in the new mode.
+// This guarantees: no stuck notes, no duplicated voices, no hanging sustain,
+// no invalid note ownership, and no clicks — at the cost of re-pressing held
+// keys, which is the safest deterministic behaviour.
 void SynthEngine::modeChangeFlush()
 {
     allNotesOff (false);
