@@ -1,5 +1,16 @@
 name: GLOBUS CI (Windows x64)
 
+# Self-maintaining release pipeline:
+#   - the version comes from CMakeLists.txt (single source of truth)
+#   - no hard-coded versions, test counts or release titles anywhere
+#   - the upgrade test discovers the previous release dynamically and falls
+#     back to a hash-pinned 1.2.1 installer when no versioned release exists
+#   - artifacts publish to the rolling `ci-latest` release with
+#     `gh release upload --clobber` (no delete-first race) AND to a permanent
+#     `v<version>` release that is kept forever
+#   - uploads retry and are verified by asset count afterwards
+#   - Authenticode signing runs only when the repository secrets exist
+
 on:
   push:
     branches: [ main ]
@@ -15,6 +26,27 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Read version from CMake
+        id: version
+        shell: pwsh
+        run: |
+          $m = Select-String -Path CMakeLists.txt -Pattern 'project\(YDCore VERSION ([0-9]+\.[0-9]+\.[0-9]+)'
+          if (-not $m) { Write-Error "could not read the project VERSION from CMakeLists.txt"; exit 1 }
+          $v = $m.Matches[0].Groups[1].Value
+          "version=$v" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "GLOBUS version (from CMakeLists.txt): $v"
+
+      - name: Check version consistency (installer matches CMake)
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          $iss = Get-Content "installer/GLOBUS-Installer.iss" -Raw
+          if ($iss -notmatch [regex]::Escape("#define MyAppVersion `"$v`"")) {
+            Write-Error "installer/GLOBUS-Installer.iss MyAppVersion does not match CMake version $v"
+            exit 1
+          }
+          Write-Host "installer version matches CMake: $v"
 
       - name: Configure (MSVC x64)
         shell: pwsh
@@ -143,8 +175,10 @@ jobs:
           & $signtool.FullName verify /pa /all /v "installer/Output/GLOBUS-Installer-Windows-x64.exe" 2>&1 | Tee-Object -Append -FilePath signing.log
           exit $LASTEXITCODE
 
-      - name: Verify upgrade from GLOBUS 1.2.0
+      - name: Verify upgrade from the previous release
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $log = "upgrade-test.log"
           $script:fails = 0
@@ -154,39 +188,75 @@ jobs:
             if (-not $cond) { $script:fails++ }
           }
 
-          # fetch the archived 1.2.0 installer (hash-pinned; either source is fine)
-          $urls = @(
-            "https://github.com/yangdozze/GLOBUS/releases/download/v1.2.0/GLOBUS-Installer-Windows-x64.exe",
-            "https://pub.hyperagent.com/api/published/pbf01KYAGW4N4_VDZ9FB50P5KXYC8Y/GLOBUS-Installer-Windows-x64.exe"
-          )
-          $got = $false
-          foreach ($u in $urls) {
-            try {
-              Invoke-WebRequest -Uri $u -OutFile old-installer.exe -UseBasicParsing -ErrorAction Stop
-              $h = (Get-FileHash old-installer.exe -Algorithm SHA256).Hash
-              if ($h -eq "807A121F58D76D8B288062BCD93A60B1C5998CF6127C6E17042394699C58351C") { $got = $true; break }
-            } catch { }
+          $verStr = "${{ steps.version.outputs.version }}"
+          $ver = [version]$verStr
+
+          # ---- discover the newest versioned release below the current version
+          $prevTag = $null; $prevUrl = $null; $prevSha = $null
+          try {
+            $rels = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" `
+                                      -Headers @{ Authorization = "Bearer $env:GH_TOKEN" }
+            $candidates = $rels | Where-Object { $_.tag_name -match '^v(\d+)\.(\d+)\.(\d+)$' } |
+                          ForEach-Object { [pscustomobject]@{ tag = $_.tag_name
+                                                              v   = [version]$_.tag_name.Substring(1)
+                                                              assets = $_.assets } } |
+                          Where-Object { $_.v -lt $ver } | Sort-Object v -Descending
+            foreach ($c in $candidates) {
+              $inst = $c.assets | Where-Object { $_.name -eq "GLOBUS-Installer-Windows-x64.exe" } | Select-Object -First 1
+              $sums = $c.assets | Where-Object { $_.name -eq "SHA256SUMS.txt" } | Select-Object -First 1
+              if ($null -ne $inst -and $null -ne $sums) {
+                $sumsTxt = (Invoke-WebRequest -Uri $sums.browser_download_url -UseBasicParsing).Content
+                $line = ($sumsTxt -split "`r?`n") | Where-Object { $_ -match "GLOBUS-Installer-Windows-x64\.exe" } | Select-Object -First 1
+                if ($line) {
+                  $prevTag = $c.tag
+                  $prevUrl = $inst.browser_download_url
+                  $prevSha = ($line -split '\s+')[0].Trim().ToLower()
+                  break
+                }
+              }
+            }
+          } catch { Write-Host "dynamic release lookup failed: $_" }
+
+          if (-not $prevSha) {
+            # first self-maintaining run: no versioned release exists yet.
+            # Fall back to the hash-pinned GLOBUS 1.2.1 installer (verified release).
+            Write-Host "no previous versioned release found - using the pinned 1.2.1 fallback"
+            $prevTag = "ci-latest (pinned 1.2.1)"
+            $prevUrl = "https://github.com/${{ github.repository }}/releases/download/ci-latest/GLOBUS-Installer-Windows-x64.exe"
+            $prevSha = "f0e91bba0a55577f9977b41e1e1245639150bbdb5205232e22f4a38273bc5415"
           }
-          Check "archived 1.2.0 installer fetched and hash-verified" $got
+          Write-Host "previous release for the upgrade test: $prevTag"
+
+          $got = $false
+          for ($try = 1; $try -le 3; $try++) {
+            try {
+              Invoke-WebRequest -Uri $prevUrl -OutFile old-installer.exe -UseBasicParsing -ErrorAction Stop
+              $h = (Get-FileHash old-installer.exe -Algorithm SHA256).Hash.ToLower()
+              if ($h -eq $prevSha) { $got = $true; break }
+              Write-Host "hash mismatch on attempt ${try}: $h"
+            } catch { Write-Host "download attempt $try failed: $_" }
+            Start-Sleep -Seconds 10
+          }
+          Check "previous installer ($prevTag) fetched and hash-verified" $got
           if (-not $got) { Get-Content $log; exit 1 }
 
-          # install 1.2.0, plant a user preset, then upgrade in place with the new build
+          # install the previous version, plant a user preset, then upgrade in place
           $p = Start-Process -FilePath "old-installer.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
-          Check "GLOBUS 1.2.0 silent install" ($p.ExitCode -eq 0)
+          Check "previous GLOBUS silent install" ($p.ExitCode -eq 0)
           $presetDir = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "GLOBUS\Presets"
           New-Item -ItemType Directory -Force -Path $presetDir | Out-Null
           '{"name":"Upgrade Survival","category":"User","params":{}}' | Out-File "$presetDir\Upgrade_Survival.json" -Encoding utf8
 
           $p2 = Start-Process -FilePath "installer\Output\GLOBUS-Installer-Windows-x64.exe" `
                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
-          Check "GLOBUS 1.2.1 upgrade install over 1.2.0" ($p2.ExitCode -eq 0)
+          Check "GLOBUS $verStr upgrade install over $prevTag" ($p2.ExitCode -eq 0)
 
           $vst3 = "C:\Program Files\Common Files\VST3\GLOBUS.vst3\Contents\x86_64-win\GLOBUS.vst3"
           $h1 = (Get-FileHash "build/YDCore_artefacts/Release/VST3/GLOBUS.vst3/Contents/x86_64-win/GLOBUS.vst3").Hash
-          Check "upgraded VST3 is the 1.2.1 build" ((Get-FileHash $vst3).Hash -eq $h1)
+          Check "upgraded VST3 is the $verStr build" ((Get-FileHash $vst3).Hash -eq $h1)
           $exe = "C:\Program Files\Ninth Parallel Audio\GLOBUS\GLOBUS.exe"
-          $ver = (Get-Item $exe).VersionInfo.ProductVersion
-          Check "upgraded standalone reports 1.2.1" ($ver -like "1.2.1*")
+          $pv = (Get-Item $exe).VersionInfo.ProductVersion
+          Check "upgraded standalone reports $verStr" ($pv -like "$verStr*")
           Check "user preset survives the upgrade" (Test-Path "$presetDir\Upgrade_Survival.json")
           $unins = @(Get-ChildItem "C:\Program Files\Ninth Parallel Audio\GLOBUS" -Filter "unins*.exe")
           Check "upgrade replaced (single uninstaller)" ($unins.Count -eq 1)
@@ -297,38 +367,67 @@ jobs:
           name: SHA256SUMS
           path: dist/SHA256SUMS.txt
 
-      - name: Publish binaries to the rolling release
+      - name: Publish releases (rolling ci-latest + permanent versioned)
         if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           SIGNED: ${{ steps.signcheck.outputs.available }}
         run: |
+          $v = "${{ steps.version.outputs.version }}"
           $signNote = if ($env:SIGNED -eq 'true') {
             "Binaries and installer are Authenticode-signed (SHA-256, RFC 3161 timestamp)."
           } else {
             "UNSIGNED DEVELOPMENT BUILD: binaries and installer carry no Authenticode signature yet, so Windows SmartScreen will show an Unknown Publisher warning. See docs/SIGNING.md for the signing setup."
           }
-          gh release delete ci-latest --yes --cleanup-tag 2>$null
-          if ($LASTEXITCODE -ne 0) { Write-Host "no previous ci-latest release" }
-          # deleting the tag is asynchronous on the server; retry the create so
-          # a race cannot silently leave the repository without a release
-          $created = $false
-          for ($try = 1; $try -le 5; $try++) {
-            gh release create ci-latest `
-              "dist/GLOBUS-Installer-Windows-x64.exe" `
-              "dist/GLOBUS-VST3-Windows-x64.zip" `
-              "dist/GLOBUS-Standalone-Windows-x64.zip" `
-              "dist/SHA256SUMS.txt" `
-              --title "GLOBUS 1.2.1 - Windows x64 (CI build)" `
-              --notes "Automated Windows x64 Release build by Ninth Parallel Audio. Easiest install: run GLOBUS-Installer-Windows-x64.exe (VST3 to Common Files\VST3, Standalone app, Start Menu shortcut, uninstaller; user presets are never touched). Manual install: unzip GLOBUS-VST3-Windows-x64.zip and copy 'GLOBUS.vst3' to C:\Program Files\Common Files\VST3, then rescan plugins in FL Studio. Verify downloads against SHA256SUMS.txt. $signNote Commit ${{ github.sha }}."
-            if ($LASTEXITCODE -eq 0) { $created = $true; break }
-            Write-Host "release create failed (attempt $try), retrying in 15 s"
-            Start-Sleep -Seconds 15
+          $notes = "Automated Windows x64 Release build by Ninth Parallel Audio. Easiest install: run GLOBUS-Installer-Windows-x64.exe (VST3 to Common Files\VST3, Standalone app, Start Menu shortcut, uninstaller; user presets are never touched). Manual install: unzip GLOBUS-VST3-Windows-x64.zip and copy 'GLOBUS.vst3' to C:\Program Files\Common Files\VST3, then rescan plugins in FL Studio. Verify downloads against SHA256SUMS.txt. $signNote Commit ${{ github.sha }}."
+          $assets = @("dist/GLOBUS-Installer-Windows-x64.exe",
+                      "dist/GLOBUS-VST3-Windows-x64.zip",
+                      "dist/GLOBUS-Standalone-Windows-x64.zip",
+                      "dist/SHA256SUMS.txt")
+
+          $targets = @(
+            @{ tag = "ci-latest"; title = "GLOBUS $v - Windows x64 (CI build)" },
+            @{ tag = "v$v";       title = "GLOBUS $v - Windows x64" }
+          )
+
+          foreach ($t in $targets) {
+            $tag = $t.tag; $title = $t.title
+
+            # ensure the release exists (create when missing - never delete)
+            gh release view $tag --json name 1>$null 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              $created = $false
+              for ($try = 1; $try -le 5; $try++) {
+                gh release create $tag --title $title --notes $notes
+                if ($LASTEXITCODE -eq 0) { $created = $true; break }
+                Write-Host "gh release create $tag failed (attempt $try), retrying in 15 s"
+                Start-Sleep -Seconds 15
+              }
+              if (-not $created) { Write-Error "gh release create $tag failed after 5 attempts"; exit 1 }
+            } else {
+              gh release edit $tag --title $title --notes $notes 1>$null
+              if ($LASTEXITCODE -ne 0) { Write-Host "warning: gh release edit $tag failed (title/notes not refreshed)" }
+            }
+
+            # upload assets with --clobber (replaces same-name assets, no delete race)
+            $uploaded = $false
+            for ($try = 1; $try -le 5; $try++) {
+              gh release upload $tag @assets --clobber
+              if ($LASTEXITCODE -eq 0) { $uploaded = $true; break }
+              Write-Host "gh release upload $tag failed (attempt $try), retrying in 15 s"
+              Start-Sleep -Seconds 15
+            }
+            if (-not $uploaded) { Write-Error "gh release upload $tag failed after 5 attempts"; exit 1 }
+
+            # verify the published release carries exactly the expected assets
+            $count = gh release view $tag --json assets --jq ".assets | length"
+            if ($LASTEXITCODE -ne 0 -or [int]$count -lt $assets.Count) {
+              Write-Error "release $tag verification failed (asset count: $count, expected $($assets.Count))"
+              exit 1
+            }
+            Write-Host "release $tag published and verified ($count assets)"
           }
-          if (-not $created) { Write-Error "gh release create failed after 5 attempts"; exit 1 }
-          gh release view ci-latest --json assets --jq ".assets | length"
-          if ($LASTEXITCODE -ne 0) { Write-Error "release verification failed"; exit 1 }
 
       - name: Publish debug logs on failure
         if: failure()
@@ -339,7 +438,7 @@ jobs:
           gh release delete ci-debug --yes --cleanup-tag 2>$null
           if ($LASTEXITCODE -ne 0) { Write-Host "no previous ci-debug release" }
           $files = @()
-          foreach ($f in @("configure.log", "build.log", "tests.log", "iscc.log", "install.log", "installer-test.log", "signing.log")) {
+          foreach ($f in @("configure.log", "build.log", "tests.log", "iscc.log", "install.log", "installer-test.log", "upgrade-test.log", "signing.log")) {
             if (Test-Path $f) { $files += $f }
           }
           if ($files.Count -eq 0) { "no logs captured" | Out-File nolog.txt; $files = @("nolog.txt") }
