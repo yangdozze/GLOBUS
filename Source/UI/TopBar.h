@@ -106,6 +106,160 @@ private:
 };
 
 //==============================================================================
+/** POLY / MONO / LEGATO selector bound to the real "playMode" APVTS parameter.
+
+    - Left-click (or Space/Return when focused) cycles POLY -> MONO -> LEGATO.
+    - Right-click opens a menu for direct selection.
+    - Arrow keys step the mode when the control has focus.
+    - Mouse wheel steps with a 250 ms cooldown so it cannot switch rapidly.
+
+    The displayed text is ONLY ever set from the parameter callback, so it
+    always reflects the real engine mode — preset loading, host automation,
+    project-state restore, Init/Randomize and any other UI all arrive through
+    the same juce::ParameterAttachment path. Mode changes made here go through
+    the attachment's complete begin/set/end gesture, so hosts record them. */
+class PlayModeSelector : public juce::Button
+{
+public:
+    explicit PlayModeSelector (juce::RangedAudioParameter& param)
+        : juce::Button ("Play mode"),
+          attachment (param, [this] (float v)
+                      {
+                          modeValue = juce::jlimit (0, 2, (int) std::lround (v));
+                          repaint();
+                      })
+    {
+        setWantsKeyboardFocus (true);
+        setTooltip ("Play mode. POLY: chords, every note its own voice. "
+                    "MONO: one voice, every separate tap retriggers. "
+                    "LEGATO: one voice, overlapped notes glide without retrigger. "
+                    "Left-click cycles, right-click picks directly. "
+                    "Changing mode gently releases sounding notes.");
+        attachment.sendInitialUpdate();
+    }
+
+    int getMode() const noexcept { return modeValue; }
+
+    juce::String getModeText() const
+    {
+        return modeValue == 0 ? "POLY" : modeValue == 1 ? "MONO" : "LEGATO";
+    }
+
+    juce::Colour getModeColour() const
+    {
+        return modeValue == 0 ? theme::accent      // blue
+             : modeValue == 1 ? theme::warn        // amber
+                              : theme::accent2;    // violet
+    }
+
+    /** Direct selection through the real parameter (complete host gesture). */
+    void setMode (int newMode)
+    {
+        newMode = juce::jlimit (0, 2, newMode);
+        if (newMode != modeValue)
+            attachment.setValueAsCompleteGesture ((float) newMode);
+    }
+
+    void clicked() override                        // left click / Space / Return
+    {
+        setMode ((modeValue + 1) % 3);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu()) { showModeMenu(); return; }
+        juce::Button::mouseDown (e);
+    }
+
+    void mouseUp (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu()) return;
+        juce::Button::mouseUp (e);
+    }
+
+    bool keyPressed (const juce::KeyPress& k) override
+    {
+        if (! isEnabled())
+            return false;
+        if (k == juce::KeyPress (juce::KeyPress::spaceKey)
+            || k == juce::KeyPress (juce::KeyPress::returnKey)
+            || k == juce::KeyPress::upKey || k == juce::KeyPress::rightKey)
+        { setMode ((modeValue + 1) % 3); return true; }
+        if (k == juce::KeyPress::downKey || k == juce::KeyPress::leftKey)
+        { setMode ((modeValue + 2) % 3); return true; }
+        return juce::Button::keyPressed (k);
+    }
+
+    bool keyStateChanged (bool) override
+    {
+        // Space/Return already step the mode once in keyPressed(); suppress
+        // Button's built-in space handling so a key press can never step twice.
+        return false;
+    }
+
+    void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails& wheel) override
+    {
+        if (! isEnabled() || std::abs (wheel.deltaY) < 0.01f)
+            return;
+        const auto now = juce::Time::getMillisecondCounter();
+        if (now - lastWheelMs < 250)               // no accidental rapid switching
+            return;
+        lastWheelMs = now;
+        setMode ((modeValue + (wheel.deltaY < 0.0f ? 1 : 2)) % 3);
+    }
+
+    void showModeMenu()
+    {
+        if (! isEnabled())
+            return;
+        juce::PopupMenu m;
+        m.addSectionHeader ("Play mode");
+        m.addItem (1, "POLY - polyphonic", true, modeValue == 0);
+        m.addItem (2, "MONO - one voice, retrigger", true, modeValue == 1);
+        m.addItem (3, "LEGATO - one voice, glide on overlap", true, modeValue == 2);
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this),
+                         [this] (int result)
+                         {
+                             if (result >= 1 && result <= 3)
+                                 setMode (result - 1);
+                         });
+    }
+
+    void paintButton (juce::Graphics& g, bool highlighted, bool down) override
+    {
+        auto b = getLocalBounds().toFloat().reduced (0.5f);
+        const auto col = getModeColour();
+        const bool en = isEnabled();
+        const bool focused = en && hasKeyboardFocus (true);
+
+        // background: normal / hover / pressed / disabled
+        const float bgAlpha = ! en ? 0.05f : down ? 0.30f : highlighted ? 0.18f : 0.10f;
+        g.setColour ((en ? col : theme::textDim).withAlpha (bgAlpha));
+        g.fillRoundedRectangle (b, 5.0f);
+
+        // outline; focus draws a stronger ring in the mode colour
+        g.setColour (! en ? theme::outline
+                          : focused ? col
+                                    : col.withAlpha (highlighted || down ? 0.85f : 0.55f));
+        g.drawRoundedRectangle (b.reduced (focused ? 0.6f : 0.0f), 5.0f, focused ? 1.6f : 1.0f);
+
+        g.setColour (! en ? theme::textDim.withAlpha (0.5f)
+                          : down ? col.brighter (0.25f) : col);
+        g.setFont (LookAndFeelYD::uiFont (10.5f, true));
+        g.drawText (getModeText(), getLocalBounds(), juce::Justification::centred);
+    }
+
+    void focusGained (FocusChangeType) override { repaint(); }
+    void focusLost (FocusChangeType) override   { repaint(); }
+    void enablementChanged() override           { repaint(); }
+
+private:
+    juce::ParameterAttachment attachment;
+    int modeValue = 0;
+    juce::uint32 lastWheelMs = 0;
+};
+
+//==============================================================================
 class TopBar : public juce::Component, private juce::Timer
 {
 public:
@@ -138,13 +292,8 @@ public:
         nextButton.onClick = [this] { processor.getPresetManager().loadNext (true); refreshPresetName(); };
         addAndMakeVisible (nextButton);
 
-        modeLabel.setJustificationType (juce::Justification::centred);
-        modeLabel.setFont (LookAndFeelYD::uiFont (10.5f, true));
-        modeLabel.setColour (juce::Label::textColourId, theme::accent);
-        modeLabel.setColour (juce::Label::outlineColourId, theme::outline);
-        modeLabel.setTooltip ("Current play mode (Poly / Mono / Legato) - change it on the GLOBAL page");
-        modeLabel.setText ("POLY", juce::dontSendNotification);
-        addAndMakeVisible (modeLabel);
+        modeSelector = std::make_unique<PlayModeSelector> (*p.getApvts().getParameter ("playMode"));
+        addAndMakeVisible (*modeSelector);
 
         saveButton.setButtonText ("SAVE");
         saveButton.setTooltip ("Save the current sound as a user preset");
@@ -274,7 +423,7 @@ public:
         presetButton.setBounds (501, y, 186, bh);
         nextButton.setBounds (690, y, 24, bh);
 
-        modeLabel.setBounds (722, y + 1, 56, bh - 2);
+        modeSelector->setBounds (722, y + 1, 60, bh - 2);
 
         saveButton.setBounds (786, y, 46, bh);
         initButton.setBounds (835, y, 42, bh);
@@ -336,8 +485,6 @@ private:
         statusLabel.setText ("CPU " + juce::String (cpu) + "%  VOX "
                              + juce::String (processor.getEngine().getActiveVoiceCount()),
                              juce::dontSendNotification);
-        const int mode = (int) processor.getApvts().getRawParameterValue ("playMode")->load();
-        modeLabel.setText (mode == 0 ? "POLY" : mode == 1 ? "MONO" : "LEGATO", juce::dontSendNotification);
         refreshPresetName();
     }
 
@@ -345,7 +492,8 @@ private:
     std::unique_ptr<TabButton> tabs[kNumTabs];
     juce::TextButton presetButton, prevButton, nextButton, saveButton, initButton, randButton,
                      randMenuButton, undoButton;
-    juce::Label statusLabel, modeLabel;
+    juce::Label statusLabel;
+    std::unique_ptr<PlayModeSelector> modeSelector;
     OutputMeter meter;
     bool midiLit = false;
 };

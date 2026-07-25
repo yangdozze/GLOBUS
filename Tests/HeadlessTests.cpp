@@ -2201,6 +2201,317 @@ static juce::AudioBuffer<float> renderBaselineScenario (const juce::String& pres
 }
 
 //==============================================================================
+// v1.2.2 play-mode selector & synchronization regression.
+// The top-bar POLY/MONO/LEGATO selector is bound to the real "playMode"
+// parameter through a juce::ParameterAttachment; these tests prove that the
+// parameter, the audible engine behaviour and the top-bar text stay
+// synchronized through preset loading, host automation, state restore,
+// Init/Randomize, manual selector interaction and rapid preset switching —
+// and that changing mode mid-performance can never leave stuck state.
+
+namespace playmodetest
+{
+/** Finds the selector inside a live editor component tree. */
+inline ydc::PlayModeSelector* findSelector (juce::Component* root)
+{
+    if (auto* s = dynamic_cast<ydc::PlayModeSelector*> (root))
+        return s;
+    for (int i = 0; i < root->getNumChildComponents(); ++i)
+        if (auto* s = findSelector (root->getChildComponent (i)))
+            return s;
+    return nullptr;
+}
+
+inline void pump (int ms = 120)
+{
+    juce::MessageManager::getInstance()->runDispatchLoopUntil (ms);
+}
+
+/** Objective engine-mode probe: hold two keys, count sounding voices.
+    Poly must run both simultaneously; Mono/Legato must keep one voice. */
+inline int voicesWithTwoKeysHeld (YDCoreAudioProcessor& proc, double sr = 48000.0, int blockSize = 512)
+{
+    juce::AudioBuffer<float> block (2, blockSize);
+    auto feed = [&] (juce::MidiBuffer& m) { block.clear(); proc.processBlock (block, m); };
+    { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::allNotesOff (1), 0); feed (m); }
+    for (int i = 0; i < 20; ++i) { juce::MidiBuffer m; feed (m); }
+    { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 48, (juce::uint8) 100), 0); feed (m); }
+    for (int i = 0; i < (int) (0.3 * sr / blockSize); ++i) { juce::MidiBuffer m; feed (m); }
+    { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 55, (juce::uint8) 100), 0); feed (m); }
+    for (int i = 0; i < (int) (0.3 * sr / blockSize); ++i) { juce::MidiBuffer m; feed (m); }
+    const int v = proc.getEngine().getActiveVoiceCount();
+    { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::allNotesOff (1), 0); feed (m); }
+    for (int i = 0; i < (int) (1.5 * sr / blockSize); ++i) { juce::MidiBuffer m; feed (m); }
+    return v;
+}
+
+inline float tailPeak (YDCoreAudioProcessor& proc, int blocks = 60, int blockSize = 512)
+{
+    juce::AudioBuffer<float> block (2, blockSize);
+    float peak = 0.0f;
+    for (int i = 0; i < blocks; ++i)
+    {
+        block.clear();
+        juce::MidiBuffer m;
+        proc.processBlock (block, m);
+        if (i >= blocks / 2)                        // measure the later half
+            peak = std::max (peak, block.getMagnitude (0, blockSize));
+    }
+    return peak;
+}
+} // namespace playmodetest
+
+void testPlayModeSelectorAndSync()
+{
+    using namespace playmodetest;
+
+    // ---- 1-3: loading Poly / Mono / Legato presets syncs parameter, engine
+    //           behaviour and the top-bar selector text
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (proc.createEditor());
+        expect (editor != nullptr, "play-mode: editor constructs");
+        editor->setSize (1200, 760);
+        auto* sel = findSelector (editor.get());
+        expect (sel != nullptr, "play-mode: selector exists in the top bar");
+        if (sel == nullptr) return;
+
+        struct Case { const char* preset; int mode; const char* text; int voices; };
+        const Case cases[] = { { "Empty Room",    0, "POLY",   2 },
+                               { "Concrete Bass", 1, "MONO",   1 },
+                               { "Glass Caller",  2, "LEGATO", 1 } };
+        for (const auto& c : cases)
+        {
+            loadPresetByName (proc, c.preset);
+            pump();
+            const int param = (int) proc.getApvts().getRawParameterValue ("playMode")->load();
+            expect (param == c.mode, juce::String ("play-mode: '") + c.preset + "' parameter is "
+                    + c.text + " (got " + juce::String (param) + ")");
+            expect (sel->getModeText() == c.text, juce::String ("play-mode: '") + c.preset
+                    + "' top-bar shows " + c.text + " (got " + sel->getModeText() + ")");
+            const int v = voicesWithTwoKeysHeld (proc);
+            expect (c.voices == 2 ? v >= 2 : v == 1, juce::String ("play-mode: '") + c.preset
+                    + "' engine voices with two keys held = " + juce::String (v));
+        }
+
+        // ---- 4: left-click cycling POLY -> MONO -> LEGATO -> POLY
+        loadPresetByName (proc, "Empty Room");
+        pump();
+        const char* expectText[] = { "MONO", "LEGATO", "POLY" };
+        for (int step = 0; step < 3; ++step)
+        {
+            sel->triggerClick();
+            pump();
+            const int param = (int) proc.getApvts().getRawParameterValue ("playMode")->load();
+            expect (param == (step + 1) % 3 && sel->getModeText() == expectText[step],
+                    "play-mode: click cycle step " + juce::String (step + 1) + " -> "
+                    + expectText[step] + " (param " + juce::String (param) + ", text " + sel->getModeText() + ")");
+        }
+
+        // ---- 5: direct selection (the right-click menu path calls setMode)
+        sel->setMode (2);
+        pump();
+        expect ((int) proc.getApvts().getRawParameterValue ("playMode")->load() == 2
+                && sel->getModeText() == "LEGATO",
+                "play-mode: direct selection chooses LEGATO");
+
+        // ---- 6: keyboard activation — Space cycles, arrows step both ways
+        sel->setMode (0); pump();
+        sel->keyPressed (juce::KeyPress (juce::KeyPress::spaceKey));
+        pump();
+        expect (sel->getModeText() == "MONO", "play-mode: Space cycles (got " + sel->getModeText() + ")");
+        sel->keyPressed (juce::KeyPress (juce::KeyPress::upKey));
+        pump();
+        expect (sel->getModeText() == "LEGATO", "play-mode: Up steps forward (got " + sel->getModeText() + ")");
+        sel->keyPressed (juce::KeyPress (juce::KeyPress::downKey));
+        pump();
+        expect (sel->getModeText() == "MONO", "play-mode: Down steps back (got " + sel->getModeText() + ")");
+
+        // ---- 8: host automation updates engine and UI
+        {
+            auto* rp = proc.getApvts().getParameter ("playMode");
+            rp->setValueNotifyingHost (rp->getNormalisableRange().convertTo0to1 (2.0f));
+            pump();
+            expect (sel->getModeText() == "LEGATO", "play-mode: automation drives the selector (got "
+                    + sel->getModeText() + ")");
+            expect (voicesWithTwoKeysHeld (proc) == 1, "play-mode: automation drives the engine (1 voice)");
+        }
+
+        // ---- 9: loading a preset after a manual change restores the preset mode
+        loadPresetByName (proc, "Glass Caller");
+        pump();
+        sel->setMode (0);
+        pump();
+        loadPresetByName (proc, "Concrete Bass");
+        pump();
+        expect (sel->getModeText() == "MONO",
+                "play-mode: preset load overrides manual change (got " + sel->getModeText() + ")");
+        loadPresetByName (proc, "Glass Caller");
+        pump();
+        expect (sel->getModeText() == "LEGATO",
+                "play-mode: legato preset restores LEGATO (got " + sel->getModeText() + ")");
+
+        // ---- 10: documented policy — Init resets to the default (POLY);
+        //          Randomize never touches the play configuration
+        proc.getPresetManager().initPatch();
+        pump();
+        expect (sel->getModeText() == "POLY", "play-mode: Init resets to POLY (got " + sel->getModeText() + ")");
+        sel->setMode (2); pump();
+        for (int i = 0; i < 4; ++i)
+            proc.getPresetManager().randomizePatch (ydc::PresetManager::Strength::Wild);
+        pump();
+        expect (sel->getModeText() == "LEGATO",
+                "play-mode: Randomize preserves the selected mode (got " + sel->getModeText() + ")");
+
+        // ---- 20: top-bar stays synchronized after rapid preset switching
+        {
+            auto& pm = proc.getPresetManager();
+            bool allSynced = true;
+            for (int i = 0; i < 24; ++i)
+            {
+                pm.loadPresetAt (i % pm.getNumPresets());
+                pump (40);
+                const int param = (int) proc.getApvts().getRawParameterValue ("playMode")->load();
+                const char* t = param == 0 ? "POLY" : param == 1 ? "MONO" : "LEGATO";
+                if (sel->getModeText() != t) allSynced = false;
+            }
+            expect (allSynced, "play-mode: selector synchronized through 24 rapid preset switches");
+        }
+    }
+
+    // ---- 7: state save/restore preserves the selected mode
+    {
+        YDCoreAudioProcessor procA;
+        procA.prepareToPlay (48000.0, 512);
+        auto* rp = procA.getApvts().getParameter ("playMode");
+        rp->setValueNotifyingHost (rp->getNormalisableRange().convertTo0to1 (1.0f));   // MONO
+        juce::MemoryBlock blob;
+        procA.getStateInformation (blob);
+
+        YDCoreAudioProcessor procB;
+        procB.prepareToPlay (48000.0, 512);
+        procB.setStateInformation (blob.getData(), (int) blob.getSize());
+        expect ((int) procB.getApvts().getRawParameterValue ("playMode")->load() == 1,
+                "play-mode: state restore preserves MONO");
+        std::unique_ptr<juce::AudioProcessorEditor> ed (procB.createEditor());
+        ed->setSize (1200, 760);
+        pump();
+        auto* sel = findSelector (ed.get());
+        expect (sel != nullptr && sel->getModeText() == "MONO",
+                "play-mode: editor opened after restore shows MONO");
+    }
+
+    // ---- 13/14: mode change while notes are held / with sustain — the
+    // documented policy (gentle release, no stuck state) at several rates
+    // and block sizes
+    for (const double sr : { 44100.0, 48000.0, 96000.0 })
+        for (const int bs : { 32, 512, 4096 })
+        {
+            YDCoreAudioProcessor proc;
+            proc.prepareToPlay (sr, bs);
+            auto* rp = proc.getApvts().getParameter ("playMode");
+            auto setMode = [&] (int m)
+            { rp->setValueNotifyingHost (rp->getNormalisableRange().convertTo0to1 ((float) m)); };
+            juce::AudioBuffer<float> block (2, bs);
+            auto feed = [&] (std::function<void (juce::MidiBuffer&)> fill = nullptr)
+            {
+                juce::MidiBuffer m;
+                if (fill) fill (m);
+                block.clear();
+                proc.processBlock (block, m);
+            };
+            const auto cfg = juce::String (sr / 1000.0, 1) + "kHz/" + juce::String (bs);
+
+            // hold a chord in POLY, switch to MONO mid-hold, release, verify silence
+            setMode (0);
+            feed ([] (juce::MidiBuffer& m)
+                  { m.addEvent (juce::MidiMessage::noteOn (1, 48, (juce::uint8) 100), 0);
+                    m.addEvent (juce::MidiMessage::noteOn (1, 55, (juce::uint8) 100), 0); });
+            for (int i = 0; i < (int) (0.2 * sr / bs); ++i) feed();
+            setMode (1);                                    // mode change while held
+            for (int i = 0; i < (int) (0.2 * sr / bs); ++i) feed();
+            feed ([] (juce::MidiBuffer& m)
+                  { m.addEvent (juce::MidiMessage::noteOff (1, 48), 0);
+                    m.addEvent (juce::MidiMessage::noteOff (1, 55), 0); });
+            const float tp = tailPeak (proc, std::max (30, (int) (2.0 * sr / bs)), bs);
+            expect (tp < 2.0e-3f, "play-mode " + cfg + ": no stuck voice after held-note mode change (tail="
+                    + juce::String (tp, 5) + ")");
+            // the very next tap must sound in the new mode
+            feed ([] (juce::MidiBuffer& m)
+                  { m.addEvent (juce::MidiMessage::noteOn (1, 52, (juce::uint8) 100), 0); });
+            float p2 = 0.0f;
+            for (int i = 0; i < (int) (0.15 * sr / bs) + 2; ++i)
+            {
+                feed();
+                p2 = std::max (p2, block.getMagnitude (0, bs));
+            }
+            expect (p2 > 1.0e-3f, "play-mode " + cfg + ": next tap after mode change sounds (peak="
+                    + juce::String (p2, 5) + ")");
+            feed ([] (juce::MidiBuffer& m) { m.addEvent (juce::MidiMessage::allNotesOff (1), 0); });
+
+            // sustain pedal held through a mode change: nothing may hang
+            for (int i = 0; i < (int) (1.5 * sr / bs); ++i) feed();
+            setMode (0);
+            feed ([] (juce::MidiBuffer& m)
+                  { m.addEvent (juce::MidiMessage::controllerEvent (1, 64, 127), 0);
+                    m.addEvent (juce::MidiMessage::noteOn (1, 50, (juce::uint8) 100), 0); });
+            for (int i = 0; i < (int) (0.15 * sr / bs); ++i) feed();
+            feed ([] (juce::MidiBuffer& m) { m.addEvent (juce::MidiMessage::noteOff (1, 50), 0); });
+            setMode (2);                                    // mode change with pedal-deferred note
+            for (int i = 0; i < (int) (0.1 * sr / bs); ++i) feed();
+            feed ([] (juce::MidiBuffer& m) { m.addEvent (juce::MidiMessage::controllerEvent (1, 64, 0), 0); });
+            const float tp2 = tailPeak (proc, std::max (30, (int) (2.0 * sr / bs)), bs);
+            expect (tp2 < 2.0e-3f, "play-mode " + cfg + ": no hanging note after sustain + mode change (tail="
+                    + juce::String (tp2, 5) + ")");
+        }
+
+    // ---- 15/16: mode change with the arpeggiator latched stays safe and
+    // CC123 still clears everything afterwards
+    {
+        YDCoreAudioProcessor proc;
+        proc.prepareToPlay (48000.0, 512);
+        auto set = [&proc] (const juce::String& id, float v)
+        {
+            auto* p = proc.getApvts().getParameter (id);
+            p->setValueNotifyingHost (p->getNormalisableRange().convertTo0to1 (v));
+        };
+        set ("arpOn", 1.0f);
+        set ("arpHold", 1.0f);
+        juce::AudioBuffer<float> block (2, 512);
+        auto feed = [&] (std::function<void (juce::MidiBuffer&)> fill = nullptr)
+        {
+            juce::MidiBuffer m;
+            if (fill) fill (m);
+            block.clear();
+            proc.processBlock (block, m);
+        };
+        feed ([] (juce::MidiBuffer& m) { m.addEvent (juce::MidiMessage::noteOn (1, 48, (juce::uint8) 100), 0); });
+        feed ([] (juce::MidiBuffer& m) { m.addEvent (juce::MidiMessage::noteOff (1, 48), 0); });
+        bool finite = true;
+        float latched = 0.0f;
+        for (int i = 0; i < 80; ++i)
+        {
+            feed();
+            latched = std::max (latched, block.getMagnitude (0, 512));
+            for (int c = 0; c < 2; ++c)
+            {
+                const float* d = block.getReadPointer (c);
+                for (int s = 0; s < 512; ++s)
+                    if (! std::isfinite (d[s])) finite = false;
+            }
+            if (i == 30) set ("playMode", 1.0f);            // switch mode while latched
+            if (i == 50) set ("playMode", 2.0f);
+        }
+        expect (finite && latched > 1.0e-4f, "play-mode: arp latch keeps running safely through mode changes");
+        feed ([] (juce::MidiBuffer& m) { m.addEvent (juce::MidiMessage::allNotesOff (1), 0); });
+        const float cleared = tailPeak (proc, 120, 512);
+        expect (cleared < 2.0e-3f, "play-mode: CC123 clears arp latch after mode changes (tail="
+                + juce::String (cleared, 5) + ")");
+    }
+}
+
+//==============================================================================
 // v1.2.1 MIDI note-reliability regression (rapid repeated notes / overlapping
 // notes). Duplicate same-pitch policy under test, as implemented by the engine:
 //   - a voice in its RELEASE tail is a finished phrase — any fresh press
@@ -2870,6 +3181,7 @@ int main (int argc, char* argv[])
     testV12FxQualityAndGainStaging();
     testV12FactoryPresets();
     testMidiNoteReliability();
+    testPlayModeSelectorAndSync();
 
     std::cout << "----------------------------------------" << std::endl;
     std::cout << checks << " checks, " << failures << " failures" << std::endl;
